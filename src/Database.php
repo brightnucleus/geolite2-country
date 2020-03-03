@@ -21,11 +21,18 @@ namespace BrightNucleus\GeoLite2Country;
  */
 class Database
 {
-
     const DB_FILENAME = 'GeoLite2-Country.mmdb';
-    const DB_FOLDER   = 'data';
-    const DB_URL      = 'http://geolite.maxmind.com/download/geoip/database/GeoLite2-Country.mmdb.gz';
-    const MD5_URL     = 'http://geolite.maxmind.com/download/geoip/database/GeoLite2-Country.md5';
+    const DB_FILENAME_EXT = '.tar.gz';
+    const DB_FOLDER = 'data';
+    const DB_URL = 'https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=__LICENSE__&suffix=tar.gz';
+
+    const HASH_URL = 'https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=__LICENSE__&suffix=tar.gz.sha256';
+    const HASH_ALGOR = 'sha256';
+    const HASH_EXT = '.sha256';
+
+    const VAR_PLACEHOLDER_LICENSE = '__LICENSE__';
+
+    const COMPOSER_EXTRA_MAXMIND_LICENSE = 'maxmind-license';
 
     /**
      * Get the location of the database file.
@@ -48,5 +55,33 @@ class Database
             'folder' => $folder,
             'file'   => self::DB_FILENAME,
         ];
+    }
+
+    /**
+     * @param $license
+     * @return string|string[]
+     */
+    public static function getDbUrl($license)
+    {
+        return self::getLicensedUrl(self::DB_URL, $license);
+    }
+
+    /**
+     * @param $license
+     * @return string|string[]
+     */
+    public static function getHashUrl($license)
+    {
+        return self::getLicensedUrl(self::HASH_URL, $license);
+    }
+
+    /**
+     * @param $url
+     * @param $license
+     * @return string|string[]
+     */
+    protected static function getLicensedUrl($url, $license)
+    {
+        return str_replace(self::VAR_PLACEHOLDER_LICENSE, $license, $url);
     }
 }

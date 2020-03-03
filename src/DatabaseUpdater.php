@@ -51,31 +51,46 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
      */
     public static function update(Event $event)
     {
-        $dbFilename = Database::getLocation();
+        // Retrieve license from root compose package
+        $composerExtra = $event->getComposer()
+            ->getPackage()
+            ->getExtra();
+        $maxmindLicense = $composerExtra[Database::COMPOSER_EXTRA_MAXMIND_LICENSE] ?? false;
 
         $io = $event->getIO();
 
+        if (!$maxmindLicense) {
+            $io->write(
+                '<error>No MaxMind license set in root composer.json. Please provide one under \'extra\' with key \'' . Database::COMPOSER_EXTRA_MAXMIND_LICENSE . '\'</error>'
+            );
+
+            return;
+        }
+
+        $dbFilename = Database::getLocation();
         $io->write('Making sure the DB folder exists: ' . dirname($dbFilename), true, IOInterface::VERBOSE);
         self::maybeCreateDBFolder(dirname($dbFilename));
 
-        $oldMD5 = self::getContents($dbFilename . '.md5');
-        $io->write('MD5 of existing local DB file: ' . $oldMD5, true, IOInterface::VERBOSE);
+        $oldHash = self::getHashFromFile($dbFilename . Database::HASH_EXT);
+        $newHashFile = $dbFilename . Database::HASH_EXT . '.new';
+        $io->write('Hash of existing local DB file: ' . $oldHash, true, IOInterface::VERBOSE);
 
-        $io->write('Fetching remote MD5 hash...');
+        $io->write('Fetching remote hash...');
         $io->write(
             sprintf(
                 'Downloading file: %1$s => %2$s',
-                Database::MD5_URL,
-                $dbFilename . '.md5.new'
+                Database::HASH_URL,
+                $newHashFile
             ),
-                true,
-                IOInterface::VERBOSE
+            true,
+            IOInterface::VERBOSE
         );
-        self::downloadFile($dbFilename . '.md5.new', Database::MD5_URL);
+        self::downloadFile($newHashFile, Database::getHashUrl($maxmindLicense));
 
-        $newMD5 = self::getContents($dbFilename . '.md5.new');
-        $io->write('MD5 of current remote DB file: ' . $newMD5, true, IOInterface::VERBOSE);
-        if ($newMD5 === $oldMD5) {
+        $newHash = self::getHashFromFile($newHashFile);
+
+        $io->write('Hash of current remote DB file: ' . $newHash, true, IOInterface::VERBOSE);
+        if ($newHash === $oldHash) {
             $io->write(
                 sprintf(
                     '<info>The local MaxMind GeoLite2 Country database is already up to date</info>. (%1$s)',
@@ -90,57 +105,72 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
         // If the download was corrupted, retry three times before aborting.
         // If the update is aborted, the currently active DB file stays in place, to not break a site on failed updates.
         $retry = 3;
+        $dbFilenameCompressed = $dbFilename . Database::DB_FILENAME_EXT;
+        $dbFilenameUrl = Database::getDbUrl($maxmindLicense);
         while ($retry > 0) {
             $io->write('Fetching new version of the MaxMind GeoLite2 Country database...', true);
             $io->write(
                 sprintf(
                     'Downloading file: %1$s => %2$s',
-                    Database::DB_URL,
-                    $dbFilename . '.gz'
+                    $dbFilenameUrl,
+                    $dbFilenameCompressed
                 ),
                 true,
                 IOInterface::VERBOSE
             );
-            self::downloadFile($dbFilename . '.gz', Database::DB_URL);
-
-            // We unzip into a temporary file, so as not to destroy the DB that is known to be working.
-            $io->write('Unzipping the database...', true);
-
-            $io->write('Unzipping file: ' . $dbFilename . '.gz => ' . $dbFilename . '.tmp', true, IOInterface::VERBOSE);
-            self::unzipFile($dbFilename . '.gz', $dbFilename . '.tmp');
-
-            $io->write('Removing file: ' . $dbFilename . '.gz', true, IOInterface::VERBOSE);
-            self::removeFile($dbFilename . '.gz');
+            self::downloadFile($dbFilenameCompressed, $dbFilenameUrl);
 
             $io->write('Verifying integrity of the downloaded database file...', true);
-            $downloadMD5 = self::calculateMD5($dbFilename . '.tmp');
-            $io->write('MD5 of downloaded DB file: ' . $downloadMD5, true, IOInterface::VERBOSE);
+            $downloadHash = self::calculateHash($dbFilenameCompressed);
+            $io->write('Hash of downloaded DB file: ' . $downloadHash, true, IOInterface::VERBOSE);
 
             // Download was successful, so now we replace the existing DB file with the freshly downloaded one.
-            if ($downloadMD5 === $newMD5) {
-                $io->write('All good, replacing previous version of the database with the downloaded one...', true);
-                $retry = 0;
+            if ($downloadHash === $newHash) {
+                // We unzip into a temporary file, so as not to destroy the DB that is known to be working.
+                $io->write('Extracting the database...', true);
+
+                $io->write('Extracting file: ' . $dbFilenameCompressed . ' => ' . $dbFilename . '.tmp', true, IOInterface::VERBOSE);
+                self::extractFile($dbFilenameCompressed, $dbFilename . '.extracted', true);
+
+                $io->write('Seeking database file in extracted archive', true, IOInterface::VERBOSE);
+                $dbFilenameExtracted = self::seekFilename(basename($dbFilename), $dbFilename . '.extracted');
+
+                if (!$dbFilenameExtracted) {
+                    $io->write('Could not find database file. Retrying..', true, IOInterface::VERBOSE);
+                    $retry--;
+                    continue;
+                }
+
+                $io->write('Moving extracted file to ' . $dbFilename, true, IOInterface::VERBOSE);
+                self::renameFile($dbFilenameExtracted, $dbFilename . '.tmp');
+
+                $io->write('Removing extracted folder file: ' . $dbFilename . '.extracted', true, IOInterface::VERBOSE);
+                self::removeDirectory($dbFilename . '.extracted');
+
+                $io->write('Replacing previous version of the database with the downloaded one...', true);
 
                 $io->write('Removing file: ' . $dbFilename, true, IOInterface::VERBOSE);
                 self::removeFile($dbFilename);
 
-                $io->write('Removing file: ' . $dbFilename . '.md5', true, IOInterface::VERBOSE);
-                self::removeFile($dbFilename . '.md5');
+                $io->write('Removing file: ' . $dbFilename . Database::HASH_EXT, true, IOInterface::VERBOSE);
+                self::removeFile($dbFilename . Database::HASH_EXT);
 
                 $io->write('Renaming file: ' . $dbFilename . '.tmp => ' . $dbFilename, true, IOInterface::VERBOSE);
                 self::renameFile($dbFilename . '.tmp', $dbFilename);
 
                 $io->write(
-                    'Renaming file: ' . $dbFilename . '.md5.new => ' . $dbFilename . '.md5',
+                    'Renaming file: ' . $newHashFile . ' => ' . $dbFilename . Database::HASH_EXT,
                     true,
                     IOInterface::VERBOSE
                 );
-                self::renameFile($dbFilename . '.md5.new', $dbFilename . '.md5');
+                self::renameFile($newHashFile, $dbFilename . Database::HASH_EXT);
+
+                $retry = 0;
                 continue;
             }
 
             // The download was fishy, so we remove intermediate files and retry.
-            $io->write('<comment>Downloaded file did not match expected MD5, retrying...</comment>', true);
+            $io->write('<comment>Downloaded file did not match expected hash, retrying...</comment>', true);
 
             $io->write('Removing file: ' . $dbFilename . '.tmp', true, IOInterface::VERBOSE);
             self::removeFile($dbFilename . '.tmp');
@@ -150,11 +180,9 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
 
         // Even several retries did not produce a proper download, so we remove intermediate files and let the user know
         // about the issue.
-        if (! isset($downloadMD5)
-            || $downloadMD5 !== $newMD5
-        ) {
-            $io->write('Removing file: ' . $dbFilename . '.md5.new', true, IOInterface::VERBOSE);
-            self::removeFile($dbFilename . '.md5.new');
+        if (!isset($downloadHash) || $downloadHash !== $newHash) {
+            $io->write('Removing file: ' . $newHashFile, true, IOInterface::VERBOSE);
+            self::removeFile($newHashFile);
 
             $io->writeError('<error>Failed to download the MaxMind GeoLite2 Country database! Aborting update.</error>');
 
@@ -179,9 +207,26 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
      */
     protected static function maybeCreateDBFolder($folder)
     {
-        if (! is_dir($folder)) {
+        if (!is_dir($folder)) {
             mkdir($folder);
         }
+    }
+
+    /**
+     * Seek for the filename within a path. Can be used for finding the file in
+     * the extracted folder.
+     *
+     * @param string $filename The filename to seek
+     * @param string $path     The path to seek from
+     * @return bool|mixed
+     */
+    protected static function seekFilename($filename, $path)
+    {
+        foreach (glob($path . '/*/' . $filename) as $found) {
+            return $found;
+        }
+
+        return false;
     }
 
     /**
@@ -194,7 +239,7 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
      */
     protected static function getContents($filename)
     {
-        if (! is_file($filename)) {
+        if (!is_file($filename)) {
             return '';
         }
 
@@ -202,16 +247,16 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
     }
 
     /**
-     * Calculate the MD5 hash of a file.
+     * Calculate the hash of a file.
      *
      * @since 0.2.1
      *
-     * @param string $filename Filename of the MD5 file.
-     * @return string MD5 hash contained within the file. Empty string if not found.
+     * @param string $filename Filename of the hash file.
+     * @return string Hash contained within the file. Empty string if not found.
      */
-    protected static function calculateMD5($filename)
+    protected static function calculateHash($filename)
     {
-        return md5(self::getContents($filename));
+        return hash(Database::HASH_ALGOR, self::getContents($filename));
     }
 
     /**
@@ -238,33 +283,42 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
     }
 
     /**
-     * Unzip a gzipped file.
+     * Extract a tar.gz file
      *
-     * @since 0.1.0
+     * @since 0.3.0
      *
-     * @param string $source      Source, zipped filename to unzip.
-     * @param string $destination Destination filename to write the unzipped contents to.
+     * @param string $source        Source, tar.gz filename to extract.
+     * @param string $destination   Destination filename to write the extracted contents to.
+     * @param bool   $delete        Delete acrhive(s) afterwards
      */
-    protected static function unzipFile($source, $destination)
+    protected static function extractFile($source, $destination, $delete = false)
     {
-        $buffer_size = 4096;
+        // Decompress .gz first?
+        if (stristr($source, '.gz')) {
+            $archive = new \PharData($source);
+            $archive->decompress();
 
-        $zippedFile   = gzopen($source, 'rb');
-        $unzippedFile = fopen($destination, 'wb');
+            // Delete the archive file?
+            if ($delete) {
+                self::removeFile($source);
+            }
 
-        while (! gzeof($zippedFile)) {
-            fwrite($unzippedFile, gzread($zippedFile, $buffer_size));
+            $source = str_ireplace('.gz', '', $source);
         }
 
-        fclose($unzippedFile);
-        gzclose($zippedFile);
+        $archive = new \PharData($source);
+        $archive->extractTo($destination, null, true);
+
+        // Delete the decompressed archive?
+        if ($delete) {
+            self::removeFile($source);
+        }
     }
 
     /**
      * Delete a file.
      *
      * @since 0.1.2
-     *
      * @param string $filename Filename of the file to delete.
      */
     protected static function removeFile($filename)
@@ -272,6 +326,21 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
         if (is_file($filename)) {
             unlink($filename);
         }
+    }
+
+    /**
+     * Recursively remove directories
+     *
+     * @param string $dir
+     * @return bool
+     */
+    protected static function removeDirectory($dir)
+    {
+        $files = array_diff(scandir($dir), ['.', '..']);
+        foreach ($files as $file) {
+            (is_dir("$dir/$file")) ? self::removeDirectory("$dir/$file") : unlink("$dir/$file");
+        }
+        return rmdir($dir);
     }
 
     /**
@@ -287,6 +356,22 @@ class DatabaseUpdater implements PluginInterface, EventSubscriberInterface
         if (is_file($source)) {
             rename($source, $destination);
         }
+    }
+
+    /**
+     * Retrieve hash from hash file
+     *
+     * @param string $file Path to filename containing the hash
+     * @return bool|mixed
+     */
+    protected static function getHashFromFile($file)
+    {
+        $newHashContents = array_values(
+            array_filter(
+                explode(' ', self::getContents($file))
+            )
+        );
+        return $newHashContents[0] ?? false;
     }
 
     /**
